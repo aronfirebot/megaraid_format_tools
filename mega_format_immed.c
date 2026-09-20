@@ -1,7 +1,9 @@
 /*
- * mega_format_immed.c - 520->512 reformat via MegaRAID passthrough, IMMED.
+ * mega_format_immed.c - reformat via MegaRAID passthrough, IMMED (e.g. a
+ * 520-byte enterprise sector size to 512 or 4096).
  *
- * Like mega_modesel.c (MODE SELECT block size 512, then FORMAT UNIT) but the
+ * Like mega_modesel.c (MODE SELECT to the target block size, then FORMAT
+ * UNIT) but the
  * FORMAT UNIT is sent with the IMMED bit set in the parameter-list header.
  *
  * Why IMMED matters: without it, FORMAT UNIT does not return until the whole
@@ -117,15 +119,32 @@ static int parse_target(const char *s) {
     return (int)v;
 }
 
+/*
+ * Parse a MODE SELECT block length. The field it goes into (mode_sel_data
+ * bytes 9-11) is 3 bytes wide, so the limit is 0xFFFFFF, not just "positive".
+ * Returns -1 on anything that is not a clean 1-16777215.
+ */
+static int parse_block_size(const char *s) {
+    char *end;
+    long v;
+
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < 1 || v > 0xFFFFFF)
+        return -1;
+    return (int)v;
+}
+
 int main(int argc, char *argv[]) {
-    int fd_dev, fd_mega, bus_no = 0, target;
+    int fd_dev, fd_mega, bus_no = 0, target, block_size;
     u8 inq_data[96];
 
-    /* MODE SELECT(6): header(4) + block descriptor(8); block length 0x000200 = 512 */
+    /* MODE SELECT(6): header(4) + block descriptor(8); bytes 9-11 (block
+       length) are filled in below once block_size is known. */
     u8 mode_sel_data[12] = {
         0x00, 0x00, 0x00, 0x08,
         0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x02, 0x00
+        0x00, 0x00, 0x00, 0x00
     };
     u8 mode_sel_cdb[6] = {0x15, 0x10, 0x00, 0x00, 12, 0x00};   /* PF=1, SP=0, param len 12 */
 
@@ -137,11 +156,12 @@ int main(int argc, char *argv[]) {
     u8 inq_cdb[6] = {0x12, 0, 0, 0, 96, 0};
 
     if (argc < 3) {
-        printf("MegaRAID Drive Formatter, IMMED (520->512 byte sectors)\n");
-        printf("Usage: %s <block_device> <target_id>\n", argv[0]);
+        printf("MegaRAID Drive Formatter, IMMED (520-byte -> 512 or 4096-byte sectors)\n");
+        printf("Usage: %s <block_device> <target_id> [block_size]\n", argv[0]);
         printf("  <block_device> any drive on the same controller (e.g. /dev/sda);\n");
         printf("                 used only to find the host number, never written to.\n");
         printf("  <target_id>    MegaRAID target id of the drive to format.\n");
+        printf("  [block_size]   sector size to set, e.g. 512 or 4096 (default 512).\n");
         return 1;
     }
     target = parse_target(argv[2]);
@@ -149,6 +169,17 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Invalid target id '%s' - expected 0-255\n", argv[2]);
         return 1;
     }
+    block_size = 512;
+    if (argc > 3) {
+        block_size = parse_block_size(argv[3]);
+        if (block_size < 0) {
+            fprintf(stderr, "Invalid block size '%s' - expected 1-16777215\n", argv[3]);
+            return 1;
+        }
+    }
+    mode_sel_data[9]  = (block_size >> 16) & 0xFF;
+    mode_sel_data[10] = (block_size >> 8) & 0xFF;
+    mode_sel_data[11] = block_size & 0xFF;
 
     /* Line-buffer stdout: the destructive warning and the abort countdown below
        are useless if they sit in a block buffer until exit, which is what
@@ -187,20 +218,20 @@ int main(int argc, char *argv[]) {
        run it before the abort countdown. That way the countdown is the LAST
        thing before data loss and the user can still bail out having seen
        whether the drive actually accepted 512-byte sectors. */
-    printf("Step 1: MODE SELECT - set block size to 512\n");
+    printf("Step 1: MODE SELECT - set block size to %d\n", block_size);
     int rc = send_cmd(fd_mega, bus_no, target, mode_sel_cdb, 6, mode_sel_data, 12, MFI_FRAME_DIR_WRITE, "MODE SELECT");
 
     int countdown = 5;
     if (rc != 0) {
         printf("\n*** MODE SELECT FAILED (status 0x%02x) ***\n", rc);
-        printf("The drive has NOT accepted 512-byte sectors. Formatting now will\n");
-        printf("destroy all data and may still leave the drive at 520 bytes.\n");
+        printf("The drive has NOT accepted %d-byte sectors. Formatting now will\n", block_size);
+        printf("destroy all data and may still leave the drive at its old size.\n");
         printf("Some drives do take the new size from FORMAT UNIT anyway, so this\n");
         printf("is not always fatal - but continue only if that is what you want.\n");
         countdown = 15;
     }
 
-    printf("\n*** FORMATTING TO 512-BYTE SECTORS IN %d SECONDS ***\n", countdown);
+    printf("\n*** FORMATTING TO %d-BYTE SECTORS IN %d SECONDS ***\n", block_size, countdown);
     printf("*** ALL DATA WILL BE DESTROYED - Ctrl+C to abort ***\n\n");
     for (int i = countdown; i > 0; i--) { printf("%d...\n", i); sleep(1); }
 
@@ -211,7 +242,7 @@ int main(int argc, char *argv[]) {
         printf("\nAccepted. Drive is now formatting in the BACKGROUND (can take hours\n");
         printf("on a multi-TB HDD). Do NOT power off until it finishes.\n");
         printf("Monitor progress with:\n");
-        printf("  ./mega_progress %s %d 60\n", argv[1], target);
+        printf("  ./mega_progress %s %d 60 %d\n", argv[1], target, block_size);
         printf("When done, clear the controller's stale cache (see README) and verify:\n");
         printf("  smartctl -d megaraid,%d -i /dev/sda | grep -i 'block size'\n", target);
     } else {

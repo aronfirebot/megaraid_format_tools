@@ -93,6 +93,22 @@ static int parse_target(const char *s) {
     return (int)v;
 }
 
+/*
+ * Parse a MODE SELECT block length. The field it goes into (mode_sel_data
+ * bytes 9-11) is 3 bytes wide, so the limit is 0xFFFFFF, not just "positive".
+ * Returns -1 on anything that is not a clean 1-16777215.
+ */
+static int parse_block_size(const char *s) {
+    char *end;
+    long v;
+
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < 1 || v > 0xFFFFFF)
+        return -1;
+    return (int)v;
+}
+
 /* INQUIRY vendor/product are 24 bytes the drive chooses, printed to a root
    operator's terminal. Escape sequences in there could scroll away or overwrite
    a destructive warning, or forge another drive's identity, so emit printable
@@ -103,12 +119,12 @@ static void print_ascii(const u8 *s, size_t n) {
 }
 
 int main(int argc, char *argv[]) {
-    int fd_dev, fd_mega, bus_no = 0, target;
+    int fd_dev, fd_mega, bus_no = 0, target, block_size;
     u8 inq_data[96];
     u8 inq_cdb[6] = {0x12, 0, 0, 0, 96, 0};
 
-    /* MODE SELECT(6) parameter: header(4) + block descriptor(8) = 12 bytes
-       Setting block size to 512 (0x000200) */
+    /* MODE SELECT(6) parameter: header(4) + block descriptor(8) = 12 bytes.
+       Bytes 9-11 (block length) are filled in below once block_size is known. */
     u8 mode_sel_data[12] = {
         0x00,                   /* Mode data length (ignored for MODE SELECT) */
         0x00,                   /* Medium type */
@@ -116,21 +132,22 @@ int main(int argc, char *argv[]) {
         0x08,                   /* Block descriptor length = 8 */
         0x00, 0x00, 0x00, 0x00, /* Number of blocks (0 = use drive default) */
         0x00,                   /* Reserved */
-        0x00, 0x02, 0x00        /* Block length = 512 bytes */
+        0x00, 0x00, 0x00        /* Block length - set below */
     };
-    
+
     /* MODE SELECT(6) CDB: PF=1 (page format), SP=0 */
     u8 mode_sel_cdb[6] = {0x15, 0x10, 0x00, 0x00, 12, 0x00};
-    
+
     /* FORMAT UNIT CDB - no data, use mode page settings */
     u8 format_cdb[6] = {0x04, 0x00, 0x00, 0x00, 0x00, 0x00};
-    
+
     if (argc < 3) {
-        printf("MegaRAID MODE SELECT + FORMAT UNIT (520->512 byte sectors)\n");
-        printf("Usage: %s <block_device> <target_id>\n", argv[0]);
+        printf("MegaRAID MODE SELECT + FORMAT UNIT (520-byte -> 512 or 4096-byte sectors)\n");
+        printf("Usage: %s <block_device> <target_id> [block_size]\n", argv[0]);
         printf("  <block_device> any drive on the same controller (e.g. /dev/sda);\n");
         printf("                 used only to find the host number, never written to.\n");
         printf("  <target_id>    MegaRAID target id of the drive to format.\n");
+        printf("  [block_size]   sector size to set, e.g. 512 or 4096 (default 512).\n");
         printf("\n");
         printf("Sends a BLOCKING FORMAT UNIT. Safe on SSDs; on a slow or multi-TB\n");
         printf("HDD use mega_format_immed instead - see README, \"The IMMED bit\".\n");
@@ -141,6 +158,17 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Invalid target id '%s' - expected 0-255\n", argv[2]);
         return 1;
     }
+    block_size = 512;
+    if (argc > 3) {
+        block_size = parse_block_size(argv[3]);
+        if (block_size < 0) {
+            fprintf(stderr, "Invalid block size '%s' - expected 1-16777215\n", argv[3]);
+            return 1;
+        }
+    }
+    mode_sel_data[9]  = (block_size >> 16) & 0xFF;
+    mode_sel_data[10] = (block_size >> 8) & 0xFF;
+    mode_sel_data[11] = block_size & 0xFF;
 
     /* Line-buffer stdout so the warning and countdown below reach the terminal
        as they happen rather than at exit when stdout is a pipe (tee, script). */
@@ -175,7 +203,7 @@ int main(int argc, char *argv[]) {
     print_ascii(inq_data + 16, 16);
     printf("\n\n");
 
-    printf("Step 1: MODE SELECT - set block size to 512\n");
+    printf("Step 1: MODE SELECT - set block size to %d\n", block_size);
     int rc = send_cmd(fd_mega, bus_no, target, mode_sel_cdb, 6, mode_sel_data, 12, MFI_FRAME_DIR_WRITE, "MODE SELECT");
 
     if (rc != 0) {
@@ -185,7 +213,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("\n*** FORMATTING TO 512-BYTE SECTORS IN 5 SECONDS ***\n");
+    printf("\n*** FORMATTING TO %d-BYTE SECTORS IN 5 SECONDS ***\n", block_size);
     printf("*** ALL DATA WILL BE DESTROYED - Ctrl+C to abort ***\n\n");
     for (int i = 5; i > 0; i--) { printf("%d...\n", i); sleep(1); }
 

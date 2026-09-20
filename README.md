@@ -115,29 +115,32 @@ as it goes, so hard defects are re-discovered and re-added - clearing the grown
 list is less lossy than it sounds, but it is still not the default here.
 
 ### 3. `mega_modesel.c` - MODE SELECT + FORMAT Tool
-Uses MODE SELECT to set block size to 512, then FORMAT UNIT to apply. This was needed for Drive 2 (slot 5) where the direct FORMAT UNIT approach didn't work.
+Uses MODE SELECT to set the block size, then FORMAT UNIT to apply. This was needed for Drive 2 (slot 5) where the direct FORMAT UNIT approach didn't work.
 
 **Usage:**
 ```bash
 gcc -o mega_modesel mega_modesel.c
-./mega_modesel /dev/sda <target_id>
+./mega_modesel /dev/sda <target_id>            # defaults to 512-byte sectors
+./mega_modesel /dev/sda <target_id> 4096       # or set 4096-byte sectors instead
 ```
 
 ### 4. `check_size.c` - Structure Validation Tool
 Validates that the MegaRAID IOCTL structures match the expected sizes (404 bytes for `megasas_iocpacket`).
 
 ### 5. `mega_format_immed.c` - FORMAT UNIT with IMMED (background format)
-Same idea as `mega_modesel.c` (MODE SELECT to 512, then FORMAT UNIT) but the
-FORMAT UNIT is sent with the **IMMED bit set** so it returns immediately and the
-drive formats in the background. This makes the reformat reliable on slow,
-multi-TB spinning drives, not just fast SSDs (see "The IMMED bit" below).
+Same idea as `mega_modesel.c` (MODE SELECT to the target block size, then FORMAT
+UNIT) but the FORMAT UNIT is sent with the **IMMED bit set** so it returns
+immediately and the drive formats in the background. This makes the reformat
+reliable on slow, multi-TB spinning drives, not just fast SSDs (see "The IMMED
+bit" below).
 
 **Usage:**
 ```bash
 gcc -o mega_format_immed mega_format_immed.c
-./mega_format_immed /dev/sda <target_id>
-# then poll progress every 60s until it finishes:
-./mega_progress /dev/sda <target_id> 60
+./mega_format_immed /dev/sda <target_id>              # defaults to 512-byte sectors
+./mega_format_immed /dev/sda <target_id> 4096          # or set 4096-byte sectors instead
+# then poll progress every 60s until it finishes (pass the same block size):
+./mega_progress /dev/sda <target_id> 60 4096
 ```
 
 ### 6. `mega_progress.c` - FORMAT UNIT progress poller
@@ -169,11 +172,16 @@ gcc -o mega_progress mega_progress.c
 ./mega_progress /dev/sda <target_id> 60
 # ...
 # Drive ready: block size 512 bytes, 3907029168 blocks (2.00 TB)
+
+# if you formatted to 4096 instead of the default 512, pass that as the
+# fourth argument so exit status 0 means "ready at 4096", not "ready at 512"
+./mega_progress /dev/sda <target_id> 60 4096
 ```
 
-Exit status: `0` = ready at 512 bytes, `2` = ready but not at 512 bytes,
-`3` = not confirmed complete (still formatting, not ready, or a UNIT ATTENTION
-got in the way), `1` = error.
+Exit status: `0` = ready at the expected block size (512 unless overridden by
+the fourth argument), `2` = ready but at a different size, `3` = not confirmed
+complete (still formatting, not ready, or a UNIT ATTENTION got in the way),
+`1` = error.
 
 `3` is deliberately **not** success: the decision it gates is whether to power
 cycle the drive, and a drive must not lose power mid-format. Note that `3` is
@@ -181,7 +189,7 @@ only ever returned by the **one-shot** form - in polling mode the tool keeps
 polling instead of returning "still busy". So the gate is:
 
 ```bash
-# one-shot: 0 only if the drive is ready AND at 512 bytes
+# one-shot: 0 only if the drive is ready AND at the expected block size
 ./mega_progress /dev/sda 4 && power_cycle
 ```
 

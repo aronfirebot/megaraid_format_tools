@@ -22,8 +22,9 @@
  * sense key of 0x0 (which equally means "nothing has happened yet").
  *
  * Exit status:
- *   0 = drive ready and at 512-byte sectors
- *   2 = drive ready but NOT at 512 bytes (reformat did not take effect)
+ *   0 = drive ready and at the expected block size (512 unless overridden)
+ *   2 = drive ready but NOT at the expected block size (reformat did not
+ *       take effect)
  *   3 = not confirmed complete (format still running, drive not ready, or a
  *       UNIT ATTENTION got in the way) - notably this is NOT success, because
  *       the thing it gates is power-cycling a drive that must not lose power
@@ -280,18 +281,37 @@ static int parse_target(const char *s) {
     return (int)v;
 }
 
+/*
+ * Parse the expected block size (the value READ CAPACITY must report for
+ * exit status 0). Returns -1 on anything that is not a clean 1-0xFFFFFFFE
+ * (0xFFFFFFFF is READ CAPACITY(10)'s own saturation marker, never a real
+ * block size).
+ */
+static int64_t parse_block_size(const char *s) {
+    char *end;
+    long long v;
+
+    errno = 0;
+    v = strtoll(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < 1 || v > 0xFFFFFFFELL)
+        return -1;
+    return (int64_t)v;
+}
+
 int main(int argc, char *argv[]) {
     int fd_dev, fd_mega, bus_no = 0, target, interval = 0;
+    u32 expected_bs = 512;
     u8 sense[96];
     u8 req_sense_cdb[6] = {0x03, 0x00, 0x00, 0x00, sizeof(sense), 0x00};
 
     if (argc < 3) {
         printf("MegaRAID FORMAT UNIT progress poller\n");
-        printf("Usage: %s <block_device> <target_id> [interval_seconds]\n", argv[0]);
+        printf("Usage: %s <block_device> <target_id> [interval_seconds] [expected_block_size]\n", argv[0]);
         printf("  With no interval, reports once and exits.\n");
-        printf("  With an interval, polls until the format completes.\n\n");
-        printf("Exit status: 0 = ready at 512 bytes, 2 = ready but not 512,\n");
-        printf("             3 = not confirmed complete, 1 = error.\n");
+        printf("  With an interval, polls until the format completes.\n");
+        printf("  expected_block_size defaults to 512; pass 4096 if that's the target size.\n\n");
+        printf("Exit status: 0 = ready at the expected block size, 2 = ready but at a\n");
+        printf("             different size, 3 = not confirmed complete, 1 = error.\n");
         return 1;
     }
     target = parse_target(argv[2]);
@@ -300,6 +320,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     if (argc > 3) interval = atoi(argv[3]);
+    if (argc > 4) {
+        int64_t bs = parse_block_size(argv[4]);
+        if (bs < 0) {
+            fprintf(stderr, "Invalid expected block size '%s' - expected 1-4294967294\n", argv[4]);
+            return 1;
+        }
+        expected_bs = (u32)bs;
+    }
 
     fd_dev = open(argv[1], O_RDWR | O_NONBLOCK);
     if (fd_dev < 0) { perror("open dev"); return 1; }
@@ -412,8 +440,8 @@ int main(int argc, char *argv[]) {
             printf(", %u blocks (%.2f TB)\n", last_lba + 1,
                    (last_lba + 1.0) * bs / 1e12);
 
-        if (bs != 512) {
-            printf("NOTE: block size is %u, not 512 - the reformat has not taken effect.\n", bs);
+        if (bs != expected_bs) {
+            printf("NOTE: block size is %u, not %u - the reformat has not taken effect.\n", bs, expected_bs);
             close(fd_mega);
             return 2;
         }
