@@ -36,6 +36,37 @@ I discovered that while the PERC H330 won't expose the drive to Linux, **smartct
 ### Key Discovery
 The MegaRAID driver (`megaraid_sas`) provides a passthrough interface at `/dev/megaraid_sas_ioctl_node` that allows sending SCSI commands to physical drives, even those marked as "unsupported."
 
+## Unified binary
+
+All six tools below can also be built and run as a single `megaraid_tool`
+binary, with each tool available as a subcommand:
+
+```bash
+make                                    # builds every standalone tool AND megaraid_tool
+./megaraid_tool                         # lists commands
+./megaraid_tool inquiry /dev/sda 4
+./megaraid_tool format_immed /dev/sda 4 4096
+./megaraid_tool progress /dev/sda 4 60 4096
+```
+
+`megaraid_tool <command>` behaves identically to running that tool's own
+standalone binary with the same arguments - it is the same source file,
+compiled into the shared binary with `-DMEGA_MULTICALL` (see
+`megaraid_tool.c` and the `Makefile`). If `megaraid_tool` is invoked (or
+copied/symlinked) under one of the original tool names below, e.g.
+`mega_inquiry`, it dispatches straight to that command with no `<command>`
+argument needed - so a symlink named after the old binary is a drop-in
+replacement for it.
+
+**Every tool below remains independently compilable** exactly as shown in its
+own section - `gcc -o mega_inquiry mega_inquiry.c` (etc.) keeps working
+unmodified, as long as `megaraid_common.h` sits next to it (it always does in
+this repo). That header is the single source of truth for the MegaRAID ioctl
+structs and the small set of helpers (`send_cmd`, `parse_target`,
+`print_ascii`, ...) every tool needs; see the comment at its top for why
+sharing it is compatible with each tool still being one `.c` file you can
+build on its own. The unified binary is purely additive.
+
 ## Tools Created
 
 ### 1. `mega_inquiry.c` - Drive Identification Tool
@@ -395,6 +426,8 @@ apt-get install build-essential smartmontools sg3-utils lsscsi
 | `mega_progress.c` | Poll background FORMAT UNIT progress via REQUEST SENSE |
 | `mega_inquiry.c` | INQUIRY test tool to verify passthrough works |
 | `check_size.c` | Structure size validation tool |
+| `megaraid_common.h` | Shared ioctl structs and helpers (`send_cmd`, `parse_target`, `print_ascii`, ...) included by every tool above |
+| `megaraid_tool.c` + `Makefile` | Multicall binary linking all of the above as subcommands - see "Unified binary" above |
 | `README.md` | This documentation |
 
 ## Troubleshooting

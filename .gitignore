@@ -9,6 +9,7 @@ mega_format_v2
 mega_format_debug
 mega_mode
 mega_final
+megaraid_tool
 
 # Object files
 *.o
