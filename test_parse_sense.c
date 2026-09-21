@@ -10,9 +10,10 @@
  *                    decision that gates "safe to power cycle")
  *   parse_target() - validates the target id that says which drive to destroy
  *
- * Build and run via ./run_tests.sh, which extracts all three straight out of
- * mega_progress.c so the code under test is literally the code that ships;
- * there is no second copy to drift.
+ * Build and run via ./run_tests.sh, which extracts parse_sense() and
+ * classify() straight out of mega_progress.c and parse_target() out of
+ * megaraid_common.h, so the code under test is literally the code that
+ * ships; there is no second copy to drift.
  *
  * check() copies each case into an exactly-sized heap buffer before calling
  * parse_sense, so a read past `len` lands outside the allocation. Under the
