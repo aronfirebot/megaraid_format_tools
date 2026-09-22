@@ -2,17 +2,33 @@
  * test_parse_sense.c - tests for the decision logic in mega_progress.c.
  *
  * These tools cannot be exercised against a MegaRAID controller in CI, so the
- * three pure functions that carry the real logic are tested against synthetic
+ * pure functions that carry the real logic are tested against synthetic
  * inputs instead:
  *
- *   parse_sense()  - decodes REQUEST SENSE data from a possibly hostile drive
- *   classify()     - decides whether the drive is still busy (the completion
- *                    decision that gates "safe to power cycle")
- *   parse_target() - validates the target id that says which drive to destroy
+ *   parse_sense()               - decodes REQUEST SENSE data from a possibly
+ *                                 hostile drive
+ *   classify()                  - decides whether the drive is still busy
+ *                                 (the completion decision that gates "safe
+ *                                 to power cycle")
+ *   parse_target()              - validates the target id that says which
+ *                                 drive to destroy
+ *   parse_block_size()          - validates a MODE SELECT block-length
+ *                                 argument (mega_modesel / mega_format_immed)
+ *   set_mode_sel_block_length() - encodes that block size into the MODE
+ *                                 SELECT parameter list bytes actually sent
+ *   parse_expected_block_size() - validates mega_progress's own block-size
+ *                                 argument
+ *   check_expected_block_size() - the comparison that decides whether
+ *                                 mega_progress reports success (0) or a
+ *                                 mismatched reformat (2)
+ *   is_unusual_block_size()    - flags a block size outside {512, 4096}, the
+ *                                 only sizes this repo has confirmed a
+ *                                 MegaRAID/PERC controller will accept, as a
+ *                                 likely typo (warn, not block)
  *
- * Build and run via ./run_tests.sh, which extracts all three straight out of
- * mega_progress.c so the code under test is literally the code that ships;
- * there is no second copy to drift.
+ * Build and run via ./run_tests.sh, which extracts each of these straight out
+ * of mega_progress.c or megaraid_common.h, so the code under test is
+ * literally the code that ships; there is no second copy to drift.
  *
  * check() copies each case into an exactly-sized heap buffer before calling
  * parse_sense, so a read past `len` lands outside the allocation. Under the
@@ -85,6 +101,81 @@ static void check_target(const char *name, const char *arg, int expected) {
     if (!ok) {
         failures++;
         printf("     parse_target(\"%s\") = %d, expected %d\n", arg, got, expected);
+    }
+}
+
+static void check_block_size(const char *name, const char *arg, int expected) {
+    int got = parse_block_size(arg);
+    int ok = (got == expected);
+
+    printf("%-58s %s\n", name, ok ? "PASS" : "FAIL");
+    if (!ok) {
+        failures++;
+        printf("     parse_block_size(\"%s\") = %d, expected %d\n", arg, got, expected);
+    }
+}
+
+static void check_expected_size_arg(const char *name, const char *arg, int64_t expected) {
+    int64_t got = parse_expected_block_size(arg);
+    int ok = (got == expected);
+
+    printf("%-58s %s\n", name, ok ? "PASS" : "FAIL");
+    if (!ok) {
+        failures++;
+        printf("     parse_expected_block_size(\"%s\") = %lld, expected %lld\n",
+               arg, (long long)got, (long long)expected);
+    }
+}
+
+/* mode_sel_data bytes 9-11, big-endian, as MODE SELECT actually receives them. */
+static void check_mode_sel_length(const char *name, int block_size,
+                                  u8 b9, u8 b10, u8 b11) {
+    u8 mode_sel_data[12];
+    int ok;
+
+    memset(mode_sel_data, 0xAA, sizeof mode_sel_data);
+    set_mode_sel_block_length(mode_sel_data, block_size);
+    ok = (mode_sel_data[9] == b9 && mode_sel_data[10] == b10 && mode_sel_data[11] == b11);
+
+    printf("%-58s %s\n", name, ok ? "PASS" : "FAIL");
+    if (!ok) {
+        failures++;
+        printf("     set_mode_sel_block_length(%d) = %02x %02x %02x, expected %02x %02x %02x\n",
+               block_size, mode_sel_data[9], mode_sel_data[10], mode_sel_data[11],
+               b9, b10, b11);
+    }
+    /* Only bytes 9-11 belong to the block length; everything else in the
+       parameter list must be left untouched. */
+    for (int i = 0; i < 9; i++) {
+        if (mode_sel_data[i] != 0xAA) {
+            failures++;
+            printf("     set_mode_sel_block_length(%d) wrote outside bytes 9-11 (byte %d = 0x%02x)\n",
+                   block_size, i, mode_sel_data[i]);
+        }
+    }
+}
+
+static void check_size_match(const char *name, u32 actual, u32 expected, int expected_status) {
+    int got = check_expected_block_size(actual, expected);
+    int ok = (got == expected_status);
+
+    printf("%-58s %s\n", name, ok ? "PASS" : "FAIL");
+    if (!ok) {
+        failures++;
+        printf("     check_expected_block_size(%u, %u) = %d, expected %d\n",
+               actual, expected, got, expected_status);
+    }
+}
+
+static void check_unusual(const char *name, long long block_size, int expected) {
+    int got = is_unusual_block_size(block_size);
+    int ok = (!!got == !!expected);
+
+    printf("%-58s %s\n", name, ok ? "PASS" : "FAIL");
+    if (!ok) {
+        failures++;
+        printf("     is_unusual_block_size(%lld) = %d, expected %d\n",
+               block_size, got, expected);
     }
 }
 
@@ -305,6 +396,64 @@ int main(void) {
        exactly the number written, so neither can select an unintended drive. */
     check_target("parse_target / \" 4\" leading space accepted", " 4", 4);
     check_target("parse_target / \"+4\" sign accepted", "+4", 4);
+
+    /* ========== parse_block_size(): mega_modesel / mega_format_immed arg === */
+
+    check_block_size("parse_block_size / \"512\" default sector size", "512", 512);
+    check_block_size("parse_block_size / \"4096\" 4K sector size", "4096", 4096);
+    check_block_size("parse_block_size / \"1\" minimum", "1", 1);
+    check_block_size("parse_block_size / \"16777215\" (0xFFFFFF) maximum", "16777215", 16777215);
+    check_block_size("parse_block_size / \"0\" out of range", "0", -1);
+    check_block_size("parse_block_size / \"16777216\" (0x1000000) out of range", "16777216", -1);
+    check_block_size("parse_block_size / \"-512\" negative", "-512", -1);
+    check_block_size("parse_block_size / \"512x\" trailing garbage", "512x", -1);
+    check_block_size("parse_block_size / \"abc\" not a number", "abc", -1);
+    check_block_size("parse_block_size / \"\" empty", "", -1);
+
+    /* ===== set_mode_sel_block_length(): the bytes MODE SELECT actually sends */
+
+    check_mode_sel_length("set_mode_sel_block_length / 512 -> 00 02 00", 512, 0x00, 0x02, 0x00);
+    check_mode_sel_length("set_mode_sel_block_length / 4096 -> 00 10 00", 4096, 0x00, 0x10, 0x00);
+    check_mode_sel_length("set_mode_sel_block_length / 520 (source size) -> 00 02 08", 520, 0x00, 0x02, 0x08);
+    check_mode_sel_length("set_mode_sel_block_length / 1 -> 00 00 01", 1, 0x00, 0x00, 0x01);
+    check_mode_sel_length("set_mode_sel_block_length / 16777215 (max) -> ff ff ff", 16777215, 0xff, 0xff, 0xff);
+    /* Off-by-one neighbours of the two real target sizes: round power-of-two
+       inputs alone wouldn't catch a bit-shift/mask regression, since 512 and
+       4096 each set only a single bit across the three encoded bytes. */
+    check_mode_sel_length("set_mode_sel_block_length / 4095 (4096 typo) -> 00 0f ff", 4095, 0x00, 0x0f, 0xff);
+    check_mode_sel_length("set_mode_sel_block_length / 513 (512 typo) -> 00 02 01", 513, 0x00, 0x02, 0x01);
+
+    /* ========== parse_expected_block_size(): mega_progress's own arg ======= */
+
+    check_expected_size_arg("parse_expected_block_size / \"512\" default", "512", 512);
+    check_expected_size_arg("parse_expected_block_size / \"4096\" 4K", "4096", 4096);
+    check_expected_size_arg("parse_expected_block_size / \"1\" minimum", "1", 1);
+    check_expected_size_arg("parse_expected_block_size / \"4294967294\" (0xFFFFFFFE) maximum", "4294967294", 4294967294LL);
+    check_expected_size_arg("parse_expected_block_size / \"0\" out of range", "0", -1);
+    check_expected_size_arg("parse_expected_block_size / \"4294967295\" (0xFFFFFFFF) is READ CAPACITY's own saturation marker, rejected", "4294967295", -1);
+    check_expected_size_arg("parse_expected_block_size / \"-1\" negative", "-1", -1);
+    check_expected_size_arg("parse_expected_block_size / \"4096x\" trailing garbage", "4096x", -1);
+    check_expected_size_arg("parse_expected_block_size / \"abc\" not a number", "abc", -1);
+    check_expected_size_arg("parse_expected_block_size / \"\" empty", "", -1);
+
+    /* == check_expected_block_size(): success only when actual == requested = */
+
+    check_size_match("check_expected_block_size / 512 actual, 512 requested -> success", 512, 512, 0);
+    check_size_match("check_expected_block_size / 4096 actual, 4096 requested -> success", 4096, 4096, 0);
+    check_size_match("check_expected_block_size / 4096 actual, 512 requested (unrequested 4K) -> mismatch", 4096, 512, 2);
+    check_size_match("check_expected_block_size / 512 actual, 4096 requested (reformat didn't take) -> mismatch", 512, 4096, 2);
+    check_size_match("check_expected_block_size / 520 actual (still enterprise size), 512 requested -> mismatch", 520, 512, 2);
+
+    /* == is_unusual_block_size(): the 512/4096 typo-guard, warn-not-block === */
+
+    check_unusual("is_unusual_block_size / 512 is a known-good size", 512, 0);
+    check_unusual("is_unusual_block_size / 4096 is a known-good size", 4096, 0);
+    check_unusual("is_unusual_block_size / 4095 (likely a 4096 typo)", 4095, 1);
+    check_unusual("is_unusual_block_size / 513 (likely a 512 typo)", 513, 1);
+    check_unusual("is_unusual_block_size / 520 (real DIF source size, still flagged)", 520, 1);
+    check_unusual("is_unusual_block_size / 4160 (real DIF source size, still flagged)", 4160, 1);
+    check_unusual("is_unusual_block_size / 1 (extreme, still flagged)", 1, 1);
+    check_unusual("is_unusual_block_size / 4294967294 (0xFFFFFFFE, u32 range)", 4294967294LL, 1);
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILURES" : "all tests passed",
            failures, failures == 1 ? "" : "s");

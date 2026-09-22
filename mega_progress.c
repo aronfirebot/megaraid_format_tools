@@ -22,8 +22,9 @@
  * sense key of 0x0 (which equally means "nothing has happened yet").
  *
  * Exit status:
- *   0 = drive ready and at 512-byte sectors
- *   2 = drive ready but NOT at 512 bytes (reformat did not take effect)
+ *   0 = drive ready and at the expected block size (512 unless overridden)
+ *   2 = drive ready but NOT at the expected block size (reformat did not
+ *       take effect)
  *   3 = not confirmed complete (format still running, drive not ready, or a
  *       UNIT ATTENTION got in the way) - notably this is NOT success, because
  *       the thing it gates is power-cycling a drive that must not lose power
@@ -42,66 +43,12 @@
 #include <errno.h>
 #include <scsi/sg.h>
 
-#define SCSI_IOCTL_GET_BUS_NUMBER 0x5386
-#define u8  uint8_t
-#define u16 uint16_t
-#define u32 uint32_t
-#define MEGASAS_MAGIC          'M'
-#define MEGASAS_IOC_FIRMWARE   _IOWR(MEGASAS_MAGIC, 1, struct megasas_iocpacket)
-#define MFI_CMD_PD_SCSI_IO     0x04
-#define MFI_FRAME_DIR_READ     0x0010
-#define MAX_IOCTL_SGE          16
+#include "megaraid_common.h"
 
 /* Consecutive failed REQUEST SENSE polls tolerated before giving up. */
 #define MAX_SOFT_ERRORS        5
 /* READ CAPACITY attempts once no format is in progress. */
 #define READ_CAP_TRIES         3
-
-struct megasas_sge32 { u32 phys_addr; u32 length; } __attribute__((packed));
-union megasas_sgl { struct megasas_sge32 sge32[1]; } __attribute__((packed));
-
-struct megasas_pthru_frame {
-  u8 cmd; u8 sense_len; u8 cmd_status; u8 scsi_status;
-  u8 target_id; u8 lun; u8 cdb_len; u8 sge_count;
-  u32 context; u32 pad_0;
-  u16 flags; u16 timeout; u32 data_xfer_len;
-  u32 sense_buf_phys_addr_lo; u32 sense_buf_phys_addr_hi;
-  u8 cdb[16];
-  union megasas_sgl sgl;
-} __attribute__((packed));
-
-struct megasas_iocpacket {
-  u16 host_no; u16 __pad1;
-  u32 sgl_off; u32 sge_count; u32 sense_off; u32 sense_len;
-  union { u8 raw[128]; struct megasas_pthru_frame pthru; } frame;
-  struct iovec sgl[MAX_IOCTL_SGE];
-} __attribute__((packed));
-
-int send_cmd(int fd, int bus, int target, u8 *cdb, int cdblen, void *data, int len, int dir) {
-    struct megasas_iocpacket ioc;
-    struct megasas_pthru_frame *pthru = &ioc.frame.pthru;
-    memset(&ioc, 0, sizeof(ioc));
-    ioc.host_no = bus;
-    if (len > 0) {
-        ioc.sge_count = 1;
-        ioc.sgl_off = offsetof(struct megasas_pthru_frame, sgl);
-        ioc.sgl[0].iov_base = data;
-        ioc.sgl[0].iov_len = len;
-        pthru->sge_count = 1;
-        pthru->data_xfer_len = len;
-        pthru->sgl.sge32[0].phys_addr = (intptr_t)data;
-        pthru->sgl.sge32[0].length = len;
-    }
-    pthru->cmd = MFI_CMD_PD_SCSI_IO;
-    pthru->cmd_status = 0xFF;
-    pthru->target_id = target;
-    pthru->cdb_len = cdblen;
-    pthru->flags = dir;
-    pthru->timeout = 0;
-    memcpy(pthru->cdb, cdb, cdblen);
-    int rc = ioctl(fd, MEGASAS_IOC_FIRMWARE, &ioc);
-    return (rc == 0) ? pthru->cmd_status : -1;
-}
 
 /*
  * Decode REQUEST SENSE data. Fixed format (response code 0x70/0x71) is what
@@ -247,7 +194,7 @@ static int read_capacity10(int fd, int bus, int target, u32 *last_lba, u32 *bloc
     u8 cap[8];
 
     memset(cap, 0, sizeof(cap));
-    if (send_cmd(fd, bus, target, cdb, 10, cap, sizeof(cap), MFI_FRAME_DIR_READ) != 0)
+    if (send_cmd(fd, bus, target, cdb, 10, cap, sizeof(cap), MFI_FRAME_DIR_READ, NULL) != 0)
         return -1;
 
     *last_lba   = ((u32)cap[0] << 24) | ((u32)cap[1] << 16) | ((u32)cap[2] << 8) | cap[3];
@@ -262,36 +209,57 @@ static int read_capacity10(int fd, int bus, int target, u32 *last_lba, u32 *bloc
 }
 
 /*
- * Parse a MegaRAID target id.
- *
- * atoi() silently turns "4x", "abc" and "" into 0 and returns no error, and
- * target_id is a u8 so 256 wraps to 0 too - either way a mistyped argument
- * aims a command at target 0 instead of refusing. Returns -1 on anything that
- * is not a clean 0-255.
+ * Parse the expected block size (the value READ CAPACITY must report for
+ * exit status 0). Distinct from megaraid_common.h's parse_block_size, which
+ * parses a MODE SELECT block-length field for a different tool and a
+ * different valid range - returns -1 on anything that is not a clean
+ * 1-0xFFFFFFFE (0xFFFFFFFF is READ CAPACITY(10)'s own saturation marker,
+ * never a real block size).
  */
-static int parse_target(const char *s) {
+static int64_t parse_expected_block_size(const char *s) {
     char *end;
-    long v;
+    long long v;
 
     errno = 0;
-    v = strtol(s, &end, 10);
-    if (errno != 0 || end == s || *end != '\0' || v < 0 || v > 255)
+    v = strtoll(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < 1 || v > 0xFFFFFFFELL)
         return -1;
-    return (int)v;
+    return (int64_t)v;
 }
+
+/*
+ * Decide the final exit status once no format is in progress: 0 when the
+ * drive's actual block size (from READ CAPACITY) matches the requested one,
+ * 2 otherwise. Split out of main()'s poll loop so the comparison that gates
+ * "the reformat actually took effect" can be tested without a controller,
+ * the same way classify() is.
+ */
+static int check_expected_block_size(u32 actual, u32 expected) {
+    return (actual == expected) ? 0 : 2;
+}
+
+/* Built alone, this file's main() is the program entry point as always. Built
+   as part of megaraid_tool (MEGA_MULTICALL), it is renamed so it can be
+   linked alongside the other tools' own main()s without colliding; see
+   megaraid_tool.c. */
+#ifdef MEGA_MULTICALL
+#define main mega_progress_main
+#endif
 
 int main(int argc, char *argv[]) {
     int fd_dev, fd_mega, bus_no = 0, target, interval = 0;
+    u32 expected_bs = 512;
     u8 sense[96];
     u8 req_sense_cdb[6] = {0x03, 0x00, 0x00, 0x00, sizeof(sense), 0x00};
 
     if (argc < 3) {
         printf("MegaRAID FORMAT UNIT progress poller\n");
-        printf("Usage: %s <block_device> <target_id> [interval_seconds]\n", argv[0]);
+        printf("Usage: %s <block_device> <target_id> [interval_seconds] [expected_block_size]\n", argv[0]);
         printf("  With no interval, reports once and exits.\n");
-        printf("  With an interval, polls until the format completes.\n\n");
-        printf("Exit status: 0 = ready at 512 bytes, 2 = ready but not 512,\n");
-        printf("             3 = not confirmed complete, 1 = error.\n");
+        printf("  With an interval, polls until the format completes.\n");
+        printf("  expected_block_size defaults to 512; pass 4096 if that's the target size.\n\n");
+        printf("Exit status: 0 = ready at the expected block size, 2 = ready but at a\n");
+        printf("             different size, 3 = not confirmed complete, 1 = error.\n");
         return 1;
     }
     target = parse_target(argv[2]);
@@ -300,6 +268,20 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     if (argc > 3) interval = atoi(argv[3]);
+    if (argc > 4) {
+        int64_t bs = parse_expected_block_size(argv[4]);
+        if (bs < 0) {
+            fprintf(stderr, "Invalid expected block size '%s' - expected 1-4294967294\n", argv[4]);
+            return 1;
+        }
+        expected_bs = (u32)bs;
+        if (is_unusual_block_size(expected_bs))
+            fprintf(stderr,
+                    "WARNING: %u is not 512 or 4096 - those are the only sizes this repo has\n"
+                    "         confirmed a MegaRAID/PERC controller will accept (see README).\n"
+                    "         Continuing anyway; Ctrl+C now if that was a typo.\n",
+                    expected_bs);
+    }
 
     fd_dev = open(argv[1], O_RDWR | O_NONBLOCK);
     if (fd_dev < 0) { perror("open dev"); return 1; }
@@ -321,7 +303,7 @@ int main(int argc, char *argv[]) {
         enum drive_state state;
 
         memset(sense, 0, sizeof(sense));
-        int rc = send_cmd(fd_mega, bus_no, target, req_sense_cdb, 6, sense, sizeof(sense), MFI_FRAME_DIR_READ);
+        int rc = send_cmd(fd_mega, bus_no, target, req_sense_cdb, 6, sense, sizeof(sense), MFI_FRAME_DIR_READ, NULL);
 
         if (rc != 0 || parse_sense(sense, sizeof(sense), &sense_key, &asc, &ascq, &progress) < 0) {
             if (rc != 0)
@@ -412,13 +394,11 @@ int main(int argc, char *argv[]) {
             printf(", %u blocks (%.2f TB)\n", last_lba + 1,
                    (last_lba + 1.0) * bs / 1e12);
 
-        if (bs != 512) {
-            printf("NOTE: block size is %u, not 512 - the reformat has not taken effect.\n", bs);
-            close(fd_mega);
-            return 2;
-        }
+        int status = check_expected_block_size(bs, expected_bs);
+        if (status != 0)
+            printf("NOTE: block size is %u, not %u - the reformat has not taken effect.\n", bs, expected_bs);
 
         close(fd_mega);
-        return 0;
+        return status;
     }
 }

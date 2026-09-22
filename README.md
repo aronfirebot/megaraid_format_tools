@@ -36,6 +36,37 @@ I discovered that while the PERC H330 won't expose the drive to Linux, **smartct
 ### Key Discovery
 The MegaRAID driver (`megaraid_sas`) provides a passthrough interface at `/dev/megaraid_sas_ioctl_node` that allows sending SCSI commands to physical drives, even those marked as "unsupported."
 
+## Unified binary
+
+All six tools below can also be built and run as a single `megaraid_tool`
+binary, with each tool available as a subcommand:
+
+```bash
+make                                    # builds every standalone tool AND megaraid_tool
+./megaraid_tool                         # lists commands
+./megaraid_tool inquiry /dev/sda 4
+./megaraid_tool format_immed /dev/sda 4 4096
+./megaraid_tool progress /dev/sda 4 60 4096
+```
+
+`megaraid_tool <command>` behaves identically to running that tool's own
+standalone binary with the same arguments - it is the same source file,
+compiled into the shared binary with `-DMEGA_MULTICALL` (see
+`megaraid_tool.c` and the `Makefile`). If `megaraid_tool` is invoked (or
+copied/symlinked) under one of the original tool names below, e.g.
+`mega_inquiry`, it dispatches straight to that command with no `<command>`
+argument needed - so a symlink named after the old binary is a drop-in
+replacement for it.
+
+**Every tool below remains independently compilable** exactly as shown in its
+own section - `gcc -o mega_inquiry mega_inquiry.c` (etc.) keeps working
+unmodified, as long as `megaraid_common.h` sits next to it (it always does in
+this repo). That header is the single source of truth for the MegaRAID ioctl
+structs and the small set of helpers (`send_cmd`, `parse_target`,
+`print_ascii`, ...) every tool needs; see the comment at its top for why
+sharing it is compatible with each tool still being one `.c` file you can
+build on its own. The unified binary is purely additive.
+
 ## Tools Created
 
 ### 1. `mega_inquiry.c` - Drive Identification Tool
@@ -115,29 +146,32 @@ as it goes, so hard defects are re-discovered and re-added - clearing the grown
 list is less lossy than it sounds, but it is still not the default here.
 
 ### 3. `mega_modesel.c` - MODE SELECT + FORMAT Tool
-Uses MODE SELECT to set block size to 512, then FORMAT UNIT to apply. This was needed for Drive 2 (slot 5) where the direct FORMAT UNIT approach didn't work.
+Uses MODE SELECT to set the block size, then FORMAT UNIT to apply. This was needed for Drive 2 (slot 5) where the direct FORMAT UNIT approach didn't work.
 
 **Usage:**
 ```bash
 gcc -o mega_modesel mega_modesel.c
-./mega_modesel /dev/sda <target_id>
+./mega_modesel /dev/sda <target_id>            # defaults to 512-byte sectors
+./mega_modesel /dev/sda <target_id> 4096       # or set 4096-byte sectors instead
 ```
 
 ### 4. `check_size.c` - Structure Validation Tool
 Validates that the MegaRAID IOCTL structures match the expected sizes (404 bytes for `megasas_iocpacket`).
 
 ### 5. `mega_format_immed.c` - FORMAT UNIT with IMMED (background format)
-Same idea as `mega_modesel.c` (MODE SELECT to 512, then FORMAT UNIT) but the
-FORMAT UNIT is sent with the **IMMED bit set** so it returns immediately and the
-drive formats in the background. This makes the reformat reliable on slow,
-multi-TB spinning drives, not just fast SSDs (see "The IMMED bit" below).
+Same idea as `mega_modesel.c` (MODE SELECT to the target block size, then FORMAT
+UNIT) but the FORMAT UNIT is sent with the **IMMED bit set** so it returns
+immediately and the drive formats in the background. This makes the reformat
+reliable on slow, multi-TB spinning drives, not just fast SSDs (see "The IMMED
+bit" below).
 
 **Usage:**
 ```bash
 gcc -o mega_format_immed mega_format_immed.c
-./mega_format_immed /dev/sda <target_id>
-# then poll progress every 60s until it finishes:
-./mega_progress /dev/sda <target_id> 60
+./mega_format_immed /dev/sda <target_id>              # defaults to 512-byte sectors
+./mega_format_immed /dev/sda <target_id> 4096          # or set 4096-byte sectors instead
+# then poll progress every 60s until it finishes (pass the same block size):
+./mega_progress /dev/sda <target_id> 60 4096
 ```
 
 ### 6. `mega_progress.c` - FORMAT UNIT progress poller
@@ -169,11 +203,16 @@ gcc -o mega_progress mega_progress.c
 ./mega_progress /dev/sda <target_id> 60
 # ...
 # Drive ready: block size 512 bytes, 3907029168 blocks (2.00 TB)
+
+# if you formatted to 4096 instead of the default 512, pass that as the
+# fourth argument so exit status 0 means "ready at 4096", not "ready at 512"
+./mega_progress /dev/sda <target_id> 60 4096
 ```
 
-Exit status: `0` = ready at 512 bytes, `2` = ready but not at 512 bytes,
-`3` = not confirmed complete (still formatting, not ready, or a UNIT ATTENTION
-got in the way), `1` = error.
+Exit status: `0` = ready at the expected block size (512 unless overridden by
+the fourth argument), `2` = ready but at a different size, `3` = not confirmed
+complete (still formatting, not ready, or a UNIT ATTENTION got in the way),
+`1` = error.
 
 `3` is deliberately **not** success: the decision it gates is whether to power
 cycle the drive, and a drive must not lose power mid-format. Note that `3` is
@@ -181,7 +220,7 @@ only ever returned by the **one-shot** form - in polling mode the tool keeps
 polling instead of returning "still busy". So the gate is:
 
 ```bash
-# one-shot: 0 only if the drive is ready AND at 512 bytes
+# one-shot: 0 only if the drive is ready AND at the expected block size
 ./mega_progress /dev/sda 4 && power_cycle
 ```
 
@@ -387,6 +426,8 @@ apt-get install build-essential smartmontools sg3-utils lsscsi
 | `mega_progress.c` | Poll background FORMAT UNIT progress via REQUEST SENSE |
 | `mega_inquiry.c` | INQUIRY test tool to verify passthrough works |
 | `check_size.c` | Structure size validation tool |
+| `megaraid_common.h` | Shared ioctl structs and helpers (`send_cmd`, `parse_target`, `print_ascii`, ...) included by every tool above |
+| `megaraid_tool.c` + `Makefile` | Multicall binary linking all of the above as subcommands - see "Unified binary" above |
 | `README.md` | This documentation |
 
 ## Troubleshooting
