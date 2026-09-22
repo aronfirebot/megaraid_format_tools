@@ -38,6 +38,12 @@
    megaraid_tool.c. */
 #ifdef MEGA_MULTICALL
 #define main mega_format_immed_main
+/* Same binary also provides "progress" as a subcommand. Recommending that
+   instead of the standalone ./mega_progress avoids pointing an operator at a
+   tool that won't exist if only this unified binary was copied to a server. */
+#define PROGRESS_CMD "megaraid_tool progress"
+#else
+#define PROGRESS_CMD "./mega_progress"
 #endif
 
 int main(int argc, char *argv[]) {
@@ -82,9 +88,13 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
-    mode_sel_data[9]  = (block_size >> 16) & 0xFF;
-    mode_sel_data[10] = (block_size >> 8) & 0xFF;
-    mode_sel_data[11] = block_size & 0xFF;
+    if (is_unusual_block_size(block_size))
+        fprintf(stderr,
+                "WARNING: %d is not 512 or 4096 - those are the only sizes this repo has\n"
+                "         confirmed a MegaRAID/PERC controller will accept via passthrough\n"
+                "         (see README). Continuing anyway; Ctrl+C now if that was a typo.\n",
+                block_size);
+    set_mode_sel_block_length(mode_sel_data, block_size);
 
     /* Line-buffer stdout: the destructive warning and the abort countdown below
        are useless if they sit in a block buffer until exit, which is what
@@ -147,12 +157,15 @@ int main(int argc, char *argv[]) {
         printf("\nAccepted. Drive is now formatting in the BACKGROUND (can take hours\n");
         printf("on a multi-TB HDD). Do NOT power off until it finishes.\n");
         printf("Monitor progress with:\n");
-        printf("  ./mega_progress %s %d 60 %d\n", argv[1], target, block_size);
+        printf("  %s %s %d 60 %d\n", PROGRESS_CMD, argv[1], target, block_size);
         printf("When done, clear the controller's stale cache (see README) and verify:\n");
         printf("  smartctl -d megaraid,%d -i /dev/sda | grep -i 'block size'\n", target);
     } else {
         printf("\nFORMAT UNIT not accepted (status 0x%02x). Inspect sense:\n", rc);
-        printf("  ./mega_progress %s %d\n", argv[1], target);
+        /* interval 0 keeps this a one-shot check (report once and exit), same
+           as before - just with the requested block size carried through so a
+           copy-pasted command doesn't silently check against the 512 default. */
+        printf("  %s %s %d 0 %d\n", PROGRESS_CMD, argv[1], target, block_size);
     }
 
     /* Exit status must survive truncation mod 256: returning a raw -1 would

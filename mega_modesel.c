@@ -68,9 +68,13 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
-    mode_sel_data[9]  = (block_size >> 16) & 0xFF;
-    mode_sel_data[10] = (block_size >> 8) & 0xFF;
-    mode_sel_data[11] = block_size & 0xFF;
+    if (is_unusual_block_size(block_size))
+        fprintf(stderr,
+                "WARNING: %d is not 512 or 4096 - those are the only sizes this repo has\n"
+                "         confirmed a MegaRAID/PERC controller will accept via passthrough\n"
+                "         (see README). Continuing anyway; Ctrl+C now if that was a typo.\n",
+                block_size);
+    set_mode_sel_block_length(mode_sel_data, block_size);
 
     /* Line-buffer stdout so the warning and countdown below reach the terminal
        as they happen rather than at exit when stdout is a pipe (tee, script). */

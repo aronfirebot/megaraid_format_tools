@@ -165,4 +165,32 @@ static inline int parse_block_size(const char *s) {
     return (int)v;
 }
 
+/*
+ * Fill in the 3-byte block length field (bytes 9-11) of a 12-byte MODE
+ * SELECT(6) block descriptor parameter list. Shared by mega_modesel.c and
+ * mega_format_immed.c so the encoding cannot drift between the two the way
+ * the pre-megaraid_common.h copies of each tool once could.
+ */
+static inline void set_mode_sel_block_length(u8 *mode_sel_data, int block_size) {
+    mode_sel_data[9]  = (block_size >> 16) & 0xFF;
+    mode_sel_data[10] = (block_size >> 8) & 0xFF;
+    mode_sel_data[11] = block_size & 0xFF;
+}
+
+/*
+ * True when a block size is not one of the two sizes this repo's own
+ * hardware testing found a MegaRAID/PERC controller to actually accept via
+ * FORMAT UNIT / MODE SELECT passthrough (512 or 4096 - see README, "The PERC
+ * H330 (and most RAID controllers) only support 512-byte or 4096-byte
+ * sectors"). Callers still send or check whatever was asked - some other
+ * MegaRAID generation might support a different size, and this repo has no
+ * way to verify that - but flag it, since a stray digit (4095, 513) is far
+ * more likely than an intentional exotic sector size. Takes a wide integer
+ * so both mega_modesel/mega_format_immed's `int` and mega_progress's `u32`
+ * (which can hold values an `int` cannot) compare correctly.
+ */
+static inline int is_unusual_block_size(long long block_size) {
+    return block_size != 512 && block_size != 4096;
+}
+
 #endif /* MEGARAID_COMMON_H */

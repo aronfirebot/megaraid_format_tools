@@ -227,6 +227,17 @@ static int64_t parse_expected_block_size(const char *s) {
     return (int64_t)v;
 }
 
+/*
+ * Decide the final exit status once no format is in progress: 0 when the
+ * drive's actual block size (from READ CAPACITY) matches the requested one,
+ * 2 otherwise. Split out of main()'s poll loop so the comparison that gates
+ * "the reformat actually took effect" can be tested without a controller,
+ * the same way classify() is.
+ */
+static int check_expected_block_size(u32 actual, u32 expected) {
+    return (actual == expected) ? 0 : 2;
+}
+
 /* Built alone, this file's main() is the program entry point as always. Built
    as part of megaraid_tool (MEGA_MULTICALL), it is renamed so it can be
    linked alongside the other tools' own main()s without colliding; see
@@ -264,6 +275,12 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         expected_bs = (u32)bs;
+        if (is_unusual_block_size(expected_bs))
+            fprintf(stderr,
+                    "WARNING: %u is not 512 or 4096 - those are the only sizes this repo has\n"
+                    "         confirmed a MegaRAID/PERC controller will accept (see README).\n"
+                    "         Continuing anyway; Ctrl+C now if that was a typo.\n",
+                    expected_bs);
     }
 
     fd_dev = open(argv[1], O_RDWR | O_NONBLOCK);
@@ -377,13 +394,11 @@ int main(int argc, char *argv[]) {
             printf(", %u blocks (%.2f TB)\n", last_lba + 1,
                    (last_lba + 1.0) * bs / 1e12);
 
-        if (bs != expected_bs) {
+        int status = check_expected_block_size(bs, expected_bs);
+        if (status != 0)
             printf("NOTE: block size is %u, not %u - the reformat has not taken effect.\n", bs, expected_bs);
-            close(fd_mega);
-            return 2;
-        }
 
         close(fd_mega);
-        return 0;
+        return status;
     }
 }

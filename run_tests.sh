@@ -27,14 +27,23 @@ extract() {
     sed -n '/^enum drive_state {/,/^};/p' mega_progress.c
     extract "static int parse_sense" mega_progress.c
     extract "static enum drive_state classify" mega_progress.c
+    extract "static int64_t parse_expected_block_size" mega_progress.c
+    extract "static int check_expected_block_size" mega_progress.c
     extract "static inline int parse_target" megaraid_common.h
+    extract "static inline int parse_block_size" megaraid_common.h
+    extract "static inline void set_mode_sel_block_length" megaraid_common.h
+    extract "static inline int is_unusual_block_size" megaraid_common.h
 } > parse_sense.inc
 
 # Guard the extraction. An empty or truncated .inc would otherwise fail the
 # compile with a confusing error, or - worse for a range that silently shrinks -
 # test less than it appears to.
 for want in "static int parse_sense" "static enum drive_state classify" \
-            "static inline int parse_target" "enum drive_state {"; do
+            "static int64_t parse_expected_block_size" \
+            "static int check_expected_block_size" \
+            "static inline int parse_target" "static inline int parse_block_size" \
+            "static inline void set_mode_sel_block_length" \
+            "static inline int is_unusual_block_size" "enum drive_state {"; do
     if ! grep -q "^$want" parse_sense.inc; then
         echo "FAIL: '$want' missing from parse_sense.inc." >&2
         echo "      run_tests.sh extracts by sed range from mega_progress.c and" >&2
@@ -47,8 +56,8 @@ done
 # Each extracted function must end with exactly one column-0 closing brace; a
 # stray '}' at column 0 inside one would truncate it silently.
 braces=$(grep -c '^}$' parse_sense.inc)
-if [ "$braces" -ne 3 ]; then
-    echo "FAIL: expected 3 column-0 closing braces in parse_sense.inc, got $braces" >&2
+if [ "$braces" -ne 8 ]; then
+    echo "FAIL: expected 8 column-0 closing braces in parse_sense.inc, got $braces" >&2
     echo "      (a '}' at column 0 inside a function truncates the extraction)" >&2
     exit 1
 fi
