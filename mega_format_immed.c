@@ -41,7 +41,7 @@
 /* Same binary also provides "progress" as a subcommand. Recommending that
    instead of the standalone ./mega_progress avoids pointing an operator at a
    tool that won't exist if only this unified binary was copied to a server. */
-#define PROGRESS_CMD "megaraid_tool progress"
+#define PROGRESS_CMD "./megaraid_tool progress"
 #else
 #define PROGRESS_CMD "./mega_progress"
 #endif
